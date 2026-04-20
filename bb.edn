@@ -1,67 +1,46 @@
-{:deps  {outskirtslabs/bb-tasks
-         {:git/url "https://github.com/outskirtslabs/bb-tasks"
-          :git/sha "e868e28b18a0496ec4d39878f0307cb1df17da22"}}
- :paths []
- :tasks {:requires
-         ([clojure.string :as str]
-                            [clojure.pprint :refer [print-table]]
-                            [babashka.tasks :refer [shell]]
-                            [ol.bb-tasks.publish-clojars :as publish-clojars])
+{:paths
+ ["src"]
+ :deps
+ {com.outskirtslabs/dirs {:mvn/version "0.1.0"}}
+ :bbin/bin
+ {libro {:main-opts ["-f" "libro"]}}
+ :tasks
+ {:init
+  (do (def paths ["src" "test"]))
 
-         :init
-         (do (def paths ["src" "test"]))
+  fmt
+  {:doc  "Format code with cljfmt"
+   :task (apply shell "cljfmt --quiet -v fix" (if (seq *command-line-args*) *command-line-args* paths))}
 
-         dev
-         {:doc  "Start a local development server"
-          :task (apply clojure "-M:repl/dev:dev" *command-line-args*)}
+  fmt:check
+  {:doc  "Check code formatting without making changes"
+   :task (apply shell "cljfmt check" paths)}
 
-         test
-         {:doc  "Run all tests or specific test suites"
-          :task (apply clojure "-M:dev:kaocha" *command-line-args*)}
+  lint
+  {:doc  "Run the clj-kondo linter on the clojure code"
+   :task (if (seq *command-line-args*)
+           (apply shell "clj-kondo" "--lint" *command-line-args*)
+           (apply shell "clj-kondo --lint" paths))}
 
-         fmt
-         {:doc  "Format code with cljfmt"
-          :task (apply shell "cljfmt --quiet -v fix" (if (seq *command-line-args*) *command-line-args* paths))}
+  test
+  {:doc         "Run test suite"
+   :extra-paths ["test"]
+   :extra-deps  {io.github.cognitect-labs/test-runner
+                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :task        (exec 'cognitect.test-runner.api/test)
+   :exec-args   {:dirs ["test"]}}
 
-         fmt:check
-         {:doc  "Check code formatting without making changes"
-          :task (apply shell "cljfmt check " paths)}
+  build
+  {:doc  "Generate uberscript from source"
+   :task (do
+           (println "Building uberscript...")
+           (babashka.fs/delete-if-exists "libro")
+           (shell "bb uberscript libro src/libro.clj")
+           (let [content (slurp "libro")]
+             (spit "libro" (str "#!/usr/bin/env bb\n" content)))
+           (shell "chmod +x libro")
+           (println "Done. Generated: libro"))}
 
-         prep
-         {:doc  "Prepare Clojure dependencies"
-          :task (apply clojure "-X:deps prep :aliases '[:dev :kaocha]'")}
-
-         deps-tree
-         {:doc  "Show dependency tree"
-          :task (clojure "-X:deps tree :aliases '[:dev]'")}
-
-         lint:copy-configs
-         {:doc  "Copy clj-kondo configs from dependencies"
-          :task (shell "clj-kondo" "--lint" (-> (shell {:out :string} "clojure -Spath -M:test:dev") :out str/trim) "--dependencies" "--copy-configs" "--skip-lint")}
-
-         lint
-         {:doc  "Lint code with clj-kondo"
-          :task (if (seq *command-line-args*)
-                  (apply shell "clj-kondo" "--lint" *command-line-args*)
-                  (apply shell "clj-kondo --lint" paths))}
-
-         qa
-         {:doc     "Run full quality assurance: format, lint, and test"
-          :depends [fmt lint test]}
-
-         ci
-         {:doc     "Run CI checks: test, format check, and lint"
-          :depends [test fmt:check lint]}
-
-         jar     {:override-builtin true
-                  :depends          [clean]
-                  :doc              "Build an jar"
-                  :task             (shell "clojure -T:build jar")}
-
-         clean   {:override-builtin true
-                  :doc              "Clean build artifacts"
-                  :task             (shell "clojure -T:build clean")}
-
-         publish {:doc     "Publish the clojure sdk libs to clojars"
-                  :depends [jar]
-                  :task    (publish-clojars/publish!)}}}
+  ci
+  {:doc     "Ran by the CI"
+   :depends [fmt:check lint test]}}}

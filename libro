@@ -1,0 +1,771 @@
+#!/usr/bin/env bb
+(ns ^:no-doc ol.dirs.runtime.windows-ffm)
+
+(def ^:private known-folder-ids
+  {:profile "{5E6C858F-0E22-4760-9AFE-EA3317B67173}"
+   :music "{4BD8D571-6D19-48D3-BE97-422220080E43}"
+   :desktop "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"
+   :documents "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"
+   :downloads "{374DE290-123F-4565-9164-39C4925E467B}"
+   :pictures "{33E28130-4E1E-4676-835A-98395C3BC3BB}"
+   :public "{DFDF76A2-C82A-4D63-906A-5644AC457385}"
+   :templates "{A63293E8-664E-48DB-A079-DF759E0509F7}"
+   :videos "{18989B1D-99B5-455B-841C-AB7C74E4DDFC}"
+   :roaming-app-data "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}"
+   :local-app-data "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}"
+   :common-app-data "{62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}"})
+
+(defn known-folder-id [folder]
+  (get known-folder-ids folder))
+
+(defn ensure-success! [hresult folder]
+  (when-not (zero? hresult)
+    (throw (ex-info "Windows Known Folder lookup failed"
+                    {:folder folder
+                     :hresult hresult}))))
+
+(defn known-folders []
+  (throw (UnsupportedOperationException.
+          "Windows Known Folder FFM lookup is not available in this environment yet.")))
+(ns ^:no-doc ol.dirs.runtime.jvm
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [ol.dirs.runtime.windows-ffm :as windows-ffm]))
+
+(defn- os-keyword []
+  (let [os-name (some-> (System/getProperty "os.name") str/lower-case)]
+    (cond
+      (str/includes? os-name "win") :windows
+      (str/includes? os-name "mac") :macos
+      :else :linux)))
+
+(defn- read-user-dirs-content [home]
+  (let [path (str home "/.config/user-dirs.dirs")
+        file (io/file path)]
+    (when (.isFile file)
+      (slurp file))))
+
+(defn current-context []
+  (let [os (os-keyword)
+        env (into {} (System/getenv))
+        home (System/getProperty "user.home")
+        base {:os os
+              :home home
+              :env env
+              :pid (.pid (java.lang.ProcessHandle/current))
+              :path-separator java.io.File/separator
+              :path-list-separator java.io.File/pathSeparator}]
+    (case os
+      :linux (assoc base :user-dirs-content (read-user-dirs-content home))
+      :macos base
+      :windows (assoc base :folders (windows-ffm/known-folders)))))
+(ns ^:no-doc ol.dirs.runtime.current
+  (:require [ol.dirs.runtime.jvm :as jvm]))
+
+(defn current-context []
+  (jvm/current-context))
+(ns ^:no-doc ol.dirs.impl
+  (:require [clojure.string :as str]))
+
+(defn windows-home-directory [env]
+  (or (get env "USERPROFILE")
+      (let [drive (get env "HOMEDRIVE")
+            path (get env "HOMEPATH")]
+        (when (and drive path)
+          (str drive path)))))
+
+(defn- blank->nil [value]
+  (when-not (str/blank? value)
+    value))
+
+(defn- trim-leading-separators [value separator]
+  (loop [s value]
+    (if (and (seq s) (str/starts-with? s separator))
+      (recur (subs s (count separator)))
+      s)))
+
+(defn- trim-trailing-separators [value separator]
+  (loop [s value]
+    (if (and (> (count s) (count separator))
+             (str/ends-with? s separator))
+      (recur (subs s 0 (- (count s) (count separator))))
+      s)))
+
+(defn join
+  ([separator left right]
+   (cond
+     (nil? left) right
+     (nil? right) left
+     (= left separator) (str left (trim-leading-separators right separator))
+     :else (str (trim-trailing-separators left separator)
+                separator
+                (trim-leading-separators right separator))))
+  ([separator left middle right]
+   (join separator (join separator left middle) right)))
+
+(defn absolute-path? [os value]
+  (let [value (blank->nil value)]
+    (boolean
+     (case os
+       :windows (or (re-find #"(?i)^[a-z]:[\\/]" value)
+                    (str/starts-with? value "\\\\"))
+       (str/starts-with? value "/")))))
+
+(defn split-absolute-path-list [os separator value]
+  (let [value (blank->nil value)]
+    (when value
+      (let [pattern (case separator
+                      ":" #":"
+                      ";" #";"
+                      (re-pattern separator))
+            parts (->> (str/split value pattern)
+                       (remove str/blank?)
+                       vec)]
+        (when (and (seq parts) (every? #(absolute-path? os %) parts))
+          parts)))))
+
+(defn map-join [separator roots fragment]
+  (mapv #(join separator % fragment) roots))
+
+(defn normalize-unix-path [value]
+  (let [absolute? (str/starts-with? value "/")
+        parts (str/split value #"/+")]
+    (->> parts
+         (reduce (fn [acc part]
+                   (cond
+                     (or (= "" part) (= "." part)) acc
+                     (= ".." part) (if (seq acc) (pop acc) acc)
+                     :else (conj acc part)))
+                 [])
+         (str/join "/")
+         (#(str (when absolute? "/") %))
+         blank->nil)))
+
+(defn- trim-collapse-whitespace [value separator lowercase?]
+  (some-> value
+          str/trim
+          (str/replace #"\s+" separator)
+          (#(if lowercase? (str/lower-case %) %))
+          not-empty))
+
+(defn application-path [os qualifier organization application]
+  (case os
+    :linux (trim-collapse-whitespace application "-" true)
+    :macos (->> [qualifier organization application]
+                (keep #(trim-collapse-whitespace % "-" false))
+                (str/join ".")
+                not-empty)
+    :windows (->> [organization application]
+                  (keep #(some-> % str/trim not-empty))
+                  (str/join "\\")
+                  not-empty)))
+
+(defn- trusted-systemd-environment? [{:keys [env pid]}]
+  (let [exec-pid (get env "SYSTEMD_EXEC_PID")
+        invocation-id (get env "INVOCATION_ID")]
+    (or (= (some-> exec-pid str/trim) (some-> pid str))
+        (not (str/blank? invocation-id)))))
+
+(defn- first-systemd-override [ctx env-key]
+  (when (trusted-systemd-environment? ctx)
+    (some->> (get-in ctx [:env env-key])
+             (#(str/split % #":"))
+             (remove str/blank?)
+             (filter #(absolute-path? (:os ctx) %))
+             first)))
+
+(def ^:private xdg-user-dir-map
+  {"XDG_MUSIC_DIR" :audio-dir
+   "XDG_DESKTOP_DIR" :desktop-dir
+   "XDG_DOCUMENTS_DIR" :document-dir
+   "XDG_DOWNLOAD_DIR" :download-dir
+   "XDG_PICTURES_DIR" :picture-dir
+   "XDG_PUBLICSHARE_DIR" :public-dir
+   "XDG_TEMPLATES_DIR" :template-dir
+   "XDG_VIDEOS_DIR" :video-dir})
+
+(defn- parse-user-dirs-content [content]
+  (when content
+    (reduce (fn [acc line]
+              (let [line (str/trim line)]
+                (if-let [[_ env-key value] (re-matches #"([A-Z_]+)=\"([^\"]*)\"" line)]
+                  (assoc acc env-key value)
+                  acc)))
+            {}
+            (str/split-lines content))))
+
+(defn- resolve-user-dir-entry [home raw-value]
+  (let [resolved (some-> raw-value
+                         (str/replace "$HOME" home)
+                         str/trim
+                         not-empty)]
+    (when (and resolved
+               (absolute-path? :linux resolved)
+               (not= resolved home)
+               (not= resolved (str home "/")))
+      resolved)))
+
+(defn- resolve-user-dirs [home content]
+  (let [entries (parse-user-dirs-content content)]
+    (reduce-kv (fn [acc env-key dir-key]
+                 (assoc acc dir-key (resolve-user-dir-entry home (get entries env-key))))
+               {}
+               xdg-user-dir-map)))
+
+(defn resolve-linux [{:keys [home user-dirs-content] :as ctx}]
+  (let [env-path (fn [key fallback]
+                   (or (some->> (get-in ctx [:env key])
+                                blank->nil
+                                (#(when (absolute-path? :linux %) %)))
+                       fallback))
+        data-home (env-path "XDG_DATA_HOME" (join "/" home ".local/share"))
+        config-home (or (first-systemd-override ctx "CONFIGURATION_DIRECTORY")
+                        (env-path "XDG_CONFIG_HOME" (join "/" home ".config")))
+        state-home (or (first-systemd-override ctx "STATE_DIRECTORY")
+                       (env-path "XDG_STATE_HOME" (join "/" home ".local/state")))
+        cache-home (or (first-systemd-override ctx "CACHE_DIRECTORY")
+                       (env-path "XDG_CACHE_HOME" (join "/" home ".cache")))
+        runtime-dir (some->> (get-in ctx [:env "XDG_RUNTIME_DIR"])
+                             blank->nil
+                             (#(when (absolute-path? :linux %) %)))
+        executable-dir (or (some->> (get-in ctx [:env "XDG_BIN_HOME"])
+                                    blank->nil
+                                    (#(when (absolute-path? :linux %) %)))
+                           (normalize-unix-path (join "/" data-home ".." "bin")))
+        data-dirs (or (split-absolute-path-list :linux ":" (get-in ctx [:env "XDG_DATA_DIRS"]))
+                      ["/usr/local/share" "/usr/share"])
+        config-dirs (or (split-absolute-path-list :linux ":" (get-in ctx [:env "XDG_CONFIG_DIRS"]))
+                        ["/etc/xdg"])]
+    (merge {:data-home data-home
+            :config-home config-home
+            :state-home state-home
+            :cache-home cache-home
+            :data-dirs data-dirs
+            :config-dirs config-dirs
+            :runtime-dir runtime-dir
+            :executable-dir executable-dir
+            :preference-dir config-home
+            :home-dir home
+            :font-dir (join "/" data-home "fonts")}
+           (resolve-user-dirs home user-dirs-content))))
+
+(defn resolve-macos [{:keys [home]}]
+  {:data-home (join "/" home "Library/Application Support")
+   :config-home (join "/" home "Library/Application Support")
+   :state-home (join "/" home "Library/Application Support")
+   :cache-home (join "/" home "Library/Caches")
+   :data-dirs ["/Library/Application Support"]
+   :config-dirs ["/Library/Application Support"]
+   :runtime-dir nil
+   :executable-dir nil
+   :preference-dir (join "/" home "Library/Preferences")
+   :home-dir home
+   :audio-dir (join "/" home "Music")
+   :desktop-dir (join "/" home "Desktop")
+   :document-dir (join "/" home "Documents")
+   :download-dir (join "/" home "Downloads")
+   :font-dir (join "/" home "Library/Fonts")
+   :picture-dir (join "/" home "Pictures")
+   :public-dir (join "/" home "Public")
+   :template-dir nil
+   :video-dir (join "/" home "Movies")})
+
+(defn resolve-windows [{:keys [home folders]}]
+  {:data-home (:roaming-app-data folders)
+   :config-home (:roaming-app-data folders)
+   :state-home (:local-app-data folders)
+   :cache-home (:local-app-data folders)
+   :data-dirs [(:common-app-data folders)]
+   :config-dirs [(:common-app-data folders)]
+   :runtime-dir nil
+   :executable-dir nil
+   :preference-dir (:roaming-app-data folders)
+   :home-dir home
+   :audio-dir (:music folders)
+   :desktop-dir (:desktop folders)
+   :document-dir (:documents folders)
+   :download-dir (:downloads folders)
+   :font-dir nil
+   :picture-dir (:pictures folders)
+   :public-dir (:public folders)
+   :template-dir (:templates folders)
+   :video-dir (:videos folders)})
+
+(def ^:private app-aware-keys
+  #{:data-home :config-home :state-home :data-dirs :config-dirs
+    :cache-home :runtime-dir :executable-dir :preference-dir
+    :state-dir :config-dir})
+
+(defn base-directories [context]
+  (case (:os context)
+    :linux (resolve-linux context)
+    :macos (resolve-macos context)
+    :windows (resolve-windows context)))
+
+(defn resolve-directory [context key & args]
+  (let [resolved (base-directories context)
+        key (case key
+              :state-dir :state-home
+              :config-dir :config-home
+              key)
+        base (get resolved key)
+        fragment (when (app-aware-keys key)
+                   (case (count args)
+                     0 nil
+                     1 (application-path (:os context) nil nil (first args))
+                     3 (apply application-path (:os context) args)
+                     (throw (ex-info "Wrong number of args" {:arg-count (count args)}))))
+        separator (:path-separator context)]
+    (cond
+      (nil? fragment) base
+      (vector? base) (map-join separator base fragment)
+      (string? base) (join separator base fragment)
+      :else base)))
+(ns ol.dirs
+  "Cross-platform directory lookup for Clojure, ClojureScript on Node, and ClojureDart.
+
+  The public API returns strings or vectors of strings and never creates directories.
+
+  - arity 0 returns the base directory
+  - arity 1 appends an application name
+  - arity 2 appends qualifier, organization, and application using platform rules
+
+  See [[config-home]], [[data-home]], [[state-home]], and [[home-dir]]."
+  (:require [ol.dirs.impl :as impl]
+            [ol.dirs.runtime.current :as current]))
+
+(defn data-home
+  "Returns the writable user data directory."
+  ([] (impl/resolve-directory (current/current-context) :data-home))
+  ([application] (impl/resolve-directory (current/current-context) :data-home application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :data-home qualifier organization application)))
+
+(defn config-home
+  "Returns the writable user configuration directory."
+  ([] (impl/resolve-directory (current/current-context) :config-home))
+  ([application] (impl/resolve-directory (current/current-context) :config-home application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :config-home qualifier organization application)))
+
+(defn state-home
+  "Returns the writable user state directory."
+  ([] (impl/resolve-directory (current/current-context) :state-home))
+  ([application] (impl/resolve-directory (current/current-context) :state-home application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :state-home qualifier organization application)))
+
+(defn data-dirs
+  "Returns the shared data search roots as a vector of strings."
+  ([] (impl/resolve-directory (current/current-context) :data-dirs))
+  ([application] (impl/resolve-directory (current/current-context) :data-dirs application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :data-dirs qualifier organization application)))
+
+(defn config-dirs
+  "Returns the shared configuration search roots as a vector of strings."
+  ([] (impl/resolve-directory (current/current-context) :config-dirs))
+  ([application] (impl/resolve-directory (current/current-context) :config-dirs application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :config-dirs qualifier organization application)))
+
+(defn cache-home
+  "Returns the writable user cache directory."
+  ([] (impl/resolve-directory (current/current-context) :cache-home))
+  ([application] (impl/resolve-directory (current/current-context) :cache-home application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :cache-home qualifier organization application)))
+
+(defn runtime-dir
+  "Returns the runtime directory, or `nil` on platforms without one."
+  ([] (impl/resolve-directory (current/current-context) :runtime-dir))
+  ([application] (impl/resolve-directory (current/current-context) :runtime-dir application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :runtime-dir qualifier organization application)))
+
+(defn executable-dir
+  "Returns the user executable directory, or `nil` when unsupported."
+  ([] (impl/resolve-directory (current/current-context) :executable-dir))
+  ([application] (impl/resolve-directory (current/current-context) :executable-dir application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :executable-dir qualifier organization application)))
+
+(defn preference-dir
+  "Returns the preference directory."
+  ([] (impl/resolve-directory (current/current-context) :preference-dir))
+  ([application] (impl/resolve-directory (current/current-context) :preference-dir application))
+  ([qualifier organization application]
+   (impl/resolve-directory (current/current-context) :preference-dir qualifier organization application)))
+
+(defn home-dir
+  "Returns the user's home directory."
+  [] (impl/resolve-directory (current/current-context) :home-dir))
+
+(defn audio-dir
+  "Returns the user's audio or music directory, or `nil` when unresolved."
+  [] (impl/resolve-directory (current/current-context) :audio-dir))
+
+(defn desktop-dir
+  "Returns the user's desktop directory, or `nil` when unresolved."
+  [] (impl/resolve-directory (current/current-context) :desktop-dir))
+
+(defn document-dir
+  "Returns the user's documents directory, or `nil` when unresolved."
+  [] (impl/resolve-directory (current/current-context) :document-dir))
+
+(defn download-dir
+  "Returns the user's downloads directory, or `nil` when unresolved."
+  [] (impl/resolve-directory (current/current-context) :download-dir))
+
+(defn font-dir
+  "Returns the user's font directory, or `nil` when unsupported."
+  [] (impl/resolve-directory (current/current-context) :font-dir))
+
+(defn picture-dir
+  "Returns the user's pictures directory, or `nil` when unresolved."
+  [] (impl/resolve-directory (current/current-context) :picture-dir))
+
+(defn public-dir
+  "Returns the user's public sharing directory, or `nil` when unresolved."
+  [] (impl/resolve-directory (current/current-context) :public-dir))
+
+(defn template-dir
+  "Returns the user's templates directory, or `nil` when unsupported or unresolved."
+  [] (impl/resolve-directory (current/current-context) :template-dir))
+
+(defn video-dir
+  "Returns the user's videos directory, or `nil` when unresolved."
+  [] (impl/resolve-directory (current/current-context) :video-dir))
+
+(defn state-dir
+  "Alias of [[state-home]]."
+  ([] (state-home))
+  ([application] (state-home application))
+  ([qualifier organization application]
+   (state-home qualifier organization application)))
+
+(defn config-dir
+  "Alias of [[config-home]]."
+  ([] (config-home))
+  ([application] (config-home application))
+  ([qualifier organization application]
+   (config-home qualifier organization application)))
+(ns libro.config
+  "Config and state persistence for libro-fm-cli.
+
+   Config lives at $XDG_CONFIG_HOME/libro-fm-cli/config.edn and holds
+   credentials plus the cached OAuth access token. State lives at
+   $XDG_STATE_HOME/libro-fm-cli/state.edn and tracks downloaded ISBNs."
+  (:require
+   [babashka.fs :as fs]
+   [clojure.edn :as edn]
+   [clojure.pprint :as pp]
+   [ol.dirs :as dirs]))
+
+(def app-name "libro-fm-cli")
+
+(defn config-path [] (str (fs/path (dirs/config-home app-name) "config.edn")))
+(defn state-path [] (str (fs/path (dirs/state-home app-name) "state.edn")))
+
+(defn- read-edn [path]
+  (when (fs/exists? path)
+    (try (edn/read-string (slurp path))
+         (catch Exception _ nil))))
+
+(defn- write-edn-secret
+  "Write EDN to path with owner-only (0600) permissions. The file may
+   contain credentials or an OAuth token, so it must never be world-readable."
+  [path data]
+  (fs/create-dirs (fs/parent path))
+  (spit path (with-out-str (pp/pprint data)))
+  (fs/set-posix-file-permissions path "rw-------"))
+
+(defn load-config
+  "Load the config file, merging in environment-variable overrides."
+  []
+  (let [env  {:username     (System/getenv "LIBRO_FM_EMAIL")
+              :password     (System/getenv "LIBRO_FM_PASSWORD")
+              :download-dir (System/getenv "LIBRO_FM_DOWNLOAD_DIR")}
+        file (or (read-edn (config-path)) {})]
+    (merge file (into {} (remove (comp nil? val) env)))))
+
+(defn save-config!
+  "Merge updates into the on-disk config file. Env-only values are not persisted."
+  [updates]
+  (let [persisted (or (read-edn (config-path)) {})
+        merged    (merge persisted updates)]
+    (write-edn-secret (config-path) merged)
+    merged))
+
+(defn load-state [] (or (read-edn (state-path)) {:downloaded {}}))
+(defn save-state! [state] (write-edn-secret (state-path) state))
+(ns libro.api
+  "HTTP client for the libro.fm JSON API.
+
+   Endpoints are observed from the jedwards1230/libro-client reference
+   and the public mobile app. Auth is OAuth 2.0 password grant; every
+   non-login request needs a Bearer token and the mobile okhttp User-Agent."
+  (:require
+   [babashka.http-client :as http]
+   [cheshire.core :as json]
+   [clojure.java.io :as io]))
+
+(def base-url "https://libro.fm")
+
+;; libro.fm's edge (awselb/2.0) rejects requests that don't look like the
+;; official mobile app. The burntcookie90/librofm-downloader reference ships
+;; these values in its Dockerfile. If logins start failing with an empty-body
+;; 401, bump these to match a current app build.
+(def app-version "7.34.8")
+(def user-agent  "okhttp/5.3.2")
+
+(defn- base-headers []
+  {"Content-Type"      "application/json"
+   "User-Agent"        user-agent
+   "X-LibroFm-AppVer"  app-version})
+
+(defn- headers
+  ([]       (base-headers))
+  ([token]  (assoc (base-headers) "Authorization" (str "Bearer " token))))
+
+(defn- parse-body [resp]
+  (let [body (:body resp)]
+    (cond
+      (nil? body)    {}
+      (string? body) (json/parse-string body true)
+      :else          (json/parse-stream (io/reader body) true))))
+
+(defn- check-response! [{:keys [status body] :as resp} ctx]
+  (when (or (nil? status) (>= status 400))
+    (let [parsed (try (parse-body resp) (catch Exception _ nil))
+          msg    (or (:error parsed)
+                     (:error_description parsed)
+                     (str "HTTP " status))]
+      (throw (ex-info (str "libro.fm API error: " msg)
+                      (merge ctx {:status   status
+                                  :body     parsed
+                                  :raw-body (if (string? body) body (str body))})))))
+  resp)
+
+(defn login
+  "POST /oauth/token with password grant. Returns {:access_token ...}."
+  [username password]
+  (-> (http/post (str base-url "/oauth/token")
+                 {:headers (headers)
+                  :body    (json/generate-string
+                            {:grant_type "password"
+                             :username   username
+                             :password   password})
+                  :throw   false})
+      (check-response! {:op :login :username username})
+      parse-body))
+
+(defn fetch-library-page
+  "GET /api/v10/library?page=N. Returns {:page :total_pages :audiobooks [...] :tags [...]}."
+  [token page]
+  (-> (http/get (str base-url "/api/v10/library")
+                {:headers      (headers token)
+                 :query-params {"page" (str page)}
+                 :throw        false})
+      (check-response! {:op :library :page page})
+      parse-body))
+
+(defn fetch-library
+  "Fetch all library pages and return the concatenated audiobooks vector."
+  [token]
+  (loop [page 1
+         acc  []]
+    (let [{:keys [total_pages audiobooks]} (fetch-library-page token page)]
+      (if (or (>= page (or total_pages 1)) (empty? audiobooks))
+        (into acc audiobooks)
+        (recur (inc page) (into acc audiobooks))))))
+
+(defn fetch-download-manifest
+  "GET /api/v10/download-manifest?isbn=... Returns download parts/tracks metadata."
+  [token isbn]
+  (-> (http/get (str base-url "/api/v10/download-manifest")
+                {:headers      (headers token)
+                 :query-params {"isbn" isbn}
+                 :throw        false})
+      (check-response! {:op :download-manifest :isbn isbn})
+      parse-body))
+
+(ns libro
+  "libro-fm-cli — a babashka CLI for interacting with libro.fm."
+  (:require
+   [babashka.cli :as cli]
+   [cheshire.core :as json]
+   [clojure.string :as str]
+   [libro.api :as api]
+   [libro.config :as config]))
+
+;;; ---------------------------------------------------------------------------
+;;; Helpers
+;;; ---------------------------------------------------------------------------
+
+(defn- die!
+  ([msg] (die! msg 1))
+  ([msg code]
+   (binding [*out* *err*] (println msg))
+   (System/exit code)))
+
+(defn- prompt
+  "Read a single line from stdin after printing prompt-text to stderr."
+  [prompt-text]
+  (binding [*out* *err*] (print prompt-text) (flush))
+  (read-line))
+
+(defn- prompt-secret
+  "Read a password from the console without echoing. Falls back to stdin if no
+   console is available (e.g. inside a pipe)."
+  [prompt-text]
+  (if-let [console (System/console)]
+    (do (binding [*out* *err*] (print prompt-text) (flush))
+        (String. (.readPassword console)))
+    (prompt prompt-text)))
+
+(defn- ensure-token!
+  "Return a valid auth token, logging in if needed. Mutates on-disk config on login."
+  []
+  (let [{:keys [auth-token username password]} (config/load-config)]
+    (if auth-token
+      auth-token
+      (let [user                   (or username (prompt "libro.fm email: "))
+            pass                   (or password (prompt-secret "libro.fm password: "))
+            _                      (when (or (str/blank? user) (str/blank? pass))
+                                     (die! "username and password are required"))
+            {:keys [access_token]} (api/login user pass)]
+        (when-not access_token
+          (die! "login failed: no access_token in response"))
+        (config/save-config! {:username user :auth-token access_token})
+        access_token))))
+
+(defn- format-duration
+  "Pretty-print duration in seconds as `Hh Mm` (e.g. 7h 42m)."
+  [seconds]
+  (when (and seconds (pos? seconds))
+    (let [h (quot seconds 3600)
+          m (quot (mod seconds 3600) 60)]
+      (format "%dh %dm" h m))))
+
+(defn- book-line [ab]
+  (let [authors   (let [a (:authors ab)]
+                    (cond (string? a) a
+                          (coll? a)   (str/join ", " a)
+                          :else       "?"))
+        narrators (some->> ab :audiobook_info :narrators (str/join ", "))
+        duration  (some-> ab :audiobook_info :duration format-duration)]
+    (str "- " (:title ab) " — " authors
+         (when duration  (str " (" duration ")"))
+         (when narrators (str "\n    narrated by " narrators))
+         "\n    ISBN " (:isbn ab))))
+
+;;; ---------------------------------------------------------------------------
+;;; Commands
+;;; ---------------------------------------------------------------------------
+
+(defn cmd-login
+  "Authenticate with libro.fm and cache the access token."
+  [_]
+  (let [{:keys [username password]} (config/load-config)
+        user                        (or username (prompt "libro.fm email: "))
+        pass                        (or password (prompt-secret "libro.fm password: "))]
+    (when (or (str/blank? user) (str/blank? pass))
+      (die! "username and password are required"))
+    (let [{:keys [access_token]} (api/login user pass)]
+      (when-not access_token
+        (die! "login failed: no access_token in response"))
+      (config/save-config! {:username user :auth-token access_token})
+      (println "Logged in. Token saved to" (config/config-path)))))
+
+(defn cmd-list
+  "List audiobooks in the user's library."
+  [{:keys [opts]}]
+  (let [token (ensure-token!)
+        books (api/fetch-library token)]
+    (cond
+      (:json opts) (println (json/generate-string books {:pretty true}))
+      (:edn opts)  (prn books)
+      :else        (do (println (count books) "audiobook(s) in library:")
+                       (doseq [ab books]
+                         (println (book-line ab)))))))
+
+(defn cmd-check
+  "List audiobooks in the library that have not yet been downloaded locally."
+  [{:keys [opts]}]
+  (let [token      (ensure-token!)
+        books      (api/fetch-library token)
+        downloaded (-> (config/load-state) :downloaded keys set)
+        new-books  (remove #(downloaded (:isbn %)) books)]
+    (cond
+      (:json opts) (println (json/generate-string new-books {:pretty true}))
+      (:edn opts)  (prn new-books)
+      :else        (do (println (count new-books) "new audiobook(s):")
+                       (doseq [ab new-books]
+                         (println (book-line ab)))))))
+
+(defn cmd-help
+  "Show help message."
+  [_]
+  (println "libro - libro-fm-cli
+
+A babashka CLI for interacting with libro.fm.
+
+Commands:
+  login             Authenticate and cache the access token
+  list              List audiobooks in your library
+  check             List audiobooks not yet downloaded locally
+  help              Show this help
+
+Environment:
+  LIBRO_FM_EMAIL         Account email (overrides config)
+  LIBRO_FM_PASSWORD      Account password (overrides config)
+  LIBRO_FM_DOWNLOAD_DIR  Download destination (overrides config)
+
+Config: ~/.config/libro-fm-cli/config.edn (XDG-aware)
+State:  ~/.local/state/libro-fm-cli/state.edn (XDG-aware)
+
+Use -h or --help with any command for more options."))
+
+;;; ---------------------------------------------------------------------------
+;;; CLI Dispatch
+;;; ---------------------------------------------------------------------------
+
+(def output-spec
+  {:json {:coerce :boolean :desc "Output as JSON"}
+   :edn  {:coerce :boolean :desc "Output as EDN"}})
+
+(def commands
+  [{:name "login" :fn cmd-login :desc "Authenticate with libro.fm" :spec {}}
+   {:name "list" :fn cmd-list :desc "List library audiobooks" :spec output-spec}
+   {:name "check" :fn cmd-check :desc "List undownloaded books" :spec output-spec}])
+
+(defn- print-cmd-help [{cmd-name :name :keys [desc spec]}]
+  (println (str "libro " cmd-name " - " desc))
+  (when (seq spec)
+    (println "\nOptions:")
+    (doseq [[k {:keys [alias desc]}] (sort-by key spec)]
+      (println (format "  --%-12s %s%s"
+                       (name k)
+                       (if alias (str "(-" (name alias) ") ") "")
+                       (or desc ""))))))
+
+(defn- wrap-help [{cmd-name :name cmd-fn :fn :keys [desc spec]}]
+  (let [spec-with-help (assoc spec :help {:alias :h :coerce :boolean :desc "Show this help"})]
+    {:cmds [cmd-name]
+     :fn   (fn [{:keys [opts] :as m}]
+             (if (:help opts)
+               (print-cmd-help {:name cmd-name :desc desc :spec spec})
+               (cmd-fn m)))
+     :spec spec-with-help}))
+
+(def dispatch-table
+  (into [{:cmds [] :fn cmd-help}
+         {:cmds ["help"] :fn cmd-help}]
+        (map wrap-help commands)))
+
+(defn -main [& args]
+  (cli/dispatch dispatch-table args))
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))
