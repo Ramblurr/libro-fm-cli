@@ -19,9 +19,9 @@
 (def user-agent  "okhttp/5.3.2")
 
 (defn- base-headers []
-  {"Content-Type"      "application/json"
-   "User-Agent"        user-agent
-   "X-LibroFm-AppVer"  app-version})
+  {"Content-Type"     "application/json"
+   "User-Agent"       user-agent
+   "X-LibroFm-AppVer" app-version})
 
 (defn- headers
   ([]       (base-headers))
@@ -87,4 +87,23 @@
                  :query-params {"isbn" isbn}
                  :throw        false})
       (check-response! {:op :download-manifest :isbn isbn})
+      parse-body))
+
+(defn fetch-packaged-m4b
+  "GET /api/v10/audiobooks/{isbn}/packaged_m4b. Returns nil when no packaged m4b exists."
+  [token isbn]
+  (let [resp (http/get (str base-url "/api/v10/audiobooks/" isbn "/packaged_m4b")
+                       {:headers (headers token)
+                        :throw   false})]
+    (when (and (:status resp) (< (:status resp) 400))
+      (parse-body resp))))
+
+(defn fetch-pdf-extra-url
+  "GET /api/v10/library/{isbn}/pdf_extra_url?filename=... Returns a signed PDF URL."
+  [token isbn filename]
+  (-> (http/get (str base-url "/api/v10/library/" isbn "/pdf_extra_url")
+                {:headers      (headers token)
+                 :query-params {"filename" filename}
+                 :throw        false})
+      (check-response! {:op :pdf-extra-url :isbn isbn :filename filename})
       parse-body))

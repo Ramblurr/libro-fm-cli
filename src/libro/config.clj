@@ -1,9 +1,8 @@
 (ns libro.config
-  "Config and state persistence for libro-fm-cli.
+  "Config persistence for libro-fm-cli.
 
    Config lives at $XDG_CONFIG_HOME/libro-fm-cli/config.edn and holds
-   credentials plus the cached OAuth access token. State lives at
-   $XDG_STATE_HOME/libro-fm-cli/state.edn and tracks downloaded ISBNs."
+   credentials plus the cached OAuth access token."
   (:require
    [babashka.fs :as fs]
    [clojure.edn :as edn]
@@ -13,7 +12,6 @@
 (def app-name "libro-fm-cli")
 
 (defn config-path [] (str (fs/path (dirs/config-home app-name) "config.edn")))
-(defn state-path [] (str (fs/path (dirs/state-home app-name) "state.edn")))
 
 (defn- read-edn [path]
   (when (fs/exists? path)
@@ -31,9 +29,8 @@
 (defn load-config
   "Load the config file, merging in environment-variable overrides."
   []
-  (let [env  {:username     (System/getenv "LIBRO_FM_EMAIL")
-              :password     (System/getenv "LIBRO_FM_PASSWORD")
-              :download-dir (System/getenv "LIBRO_FM_DOWNLOAD_DIR")}
+  (let [env  {:username (System/getenv "LIBRO_FM_EMAIL")
+              :password (System/getenv "LIBRO_FM_PASSWORD")}
         file (or (read-edn (config-path)) {})]
     (merge file (into {} (remove (comp nil? val) env)))))
 
@@ -44,6 +41,3 @@
         merged    (merge persisted updates)]
     (write-edn-secret (config-path) merged)
     merged))
-
-(defn load-state [] (or (read-edn (state-path)) {:downloaded {}}))
-(defn save-state! [state] (write-edn-secret (state-path) state))
