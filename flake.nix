@@ -1,10 +1,10 @@
 {
   description = "libro-fm-cli - babashka CLI for libro.fm";
   inputs = {
-    nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1"; # tracks nixpkgs unstable branch
+    nixpkgs.url = "github:ramblurr/nixpkgs/channel/personal-unstable";
     devshell.url = "github:numtide/devshell";
     devshell.inputs.nixpkgs.follows = "nixpkgs";
-    devenv.url = "https://flakehub.com/f/ramblurr/nix-devenv/*";
+    devenv.url = "github:ramblurr/nix-devenv";
     devenv.inputs.nixpkgs.follows = "nixpkgs";
   };
   outputs =
